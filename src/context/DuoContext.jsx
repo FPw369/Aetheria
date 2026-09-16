@@ -2,7 +2,8 @@ import React, { createContext, useContext, useState, useEffect, useMemo, useCall
 import confetti from 'canvas-confetti';
 import { useAudio } from '../hooks/useAudio';
 
-const STORAGE_KEY = 'aetheria_duo_mindfulness_v1';
+const STORAGE_KEY = 'aetheria_duo_mindfulness_v2';
+const OLD_STORAGE_KEY = 'aetheria_duo_mindfulness_v1';
 
 const DEFAULT_STATE = {
   profiles: {
@@ -36,21 +37,34 @@ const DuoContext = createContext(null);
 export function DuoProvider({ children }) {
   const [state, setState] = useState(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      let raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) {
+        const oldRaw = localStorage.getItem(OLD_STORAGE_KEY);
+        if (oldRaw) {
+          raw = oldRaw;
+        }
+      }
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (parsed.profiles?.partnerA?.name === 'Alex') {
-          parsed.profiles.partnerA.name = 'Rico';
-        }
-        if (parsed.profiles?.partnerB?.name === 'Maya') {
-          parsed.profiles.partnerB.name = 'Laik';
-        }
+        const profileA = parsed.profiles?.partnerA || {};
+        const profileB = parsed.profiles?.partnerB || {};
+        if (!profileA.name || profileA.name === 'Alex') profileA.name = 'Rico';
+        if (!profileB.name || profileB.name === 'Maya') profileB.name = 'Laik';
+
         return {
           ...DEFAULT_STATE,
           ...parsed,
           profiles: {
-            ...DEFAULT_STATE.profiles,
-            ...(parsed.profiles || {})
+            partnerA: {
+              ...DEFAULT_STATE.profiles.partnerA,
+              ...profileA,
+              name: profileA.name || 'Rico',
+            },
+            partnerB: {
+              ...DEFAULT_STATE.profiles.partnerB,
+              ...profileB,
+              name: profileB.name || 'Laik',
+            }
           }
         };
       }

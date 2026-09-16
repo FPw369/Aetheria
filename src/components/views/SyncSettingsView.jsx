@@ -24,6 +24,13 @@ export function SyncSettingsView() {
   const [partnerBAvatar, setPartnerBAvatar] = useState(state.profiles.partnerB.avatar);
   const [savedProfiles, setSavedProfiles] = useState(false);
 
+  React.useEffect(() => {
+    setPartnerAName(state.profiles.partnerA.name);
+    setPartnerBName(state.profiles.partnerB.name);
+    setPartnerAAvatar(state.profiles.partnerA.avatar);
+    setPartnerBAvatar(state.profiles.partnerB.avatar);
+  }, [state.profiles]);
+
   const [importJsonText, setImportJsonText] = useState('');
   const [importError, setImportError] = useState(false);
   const [importSuccess, setImportSuccess] = useState(false);
