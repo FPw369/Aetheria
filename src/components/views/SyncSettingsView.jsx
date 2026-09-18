@@ -1,16 +1,22 @@
 import React, { useState } from 'react';
 import { 
   Settings, UserCheck, QrCode, Copy, Check, 
-  Download, Upload, RotateCcw, Sparkles, Heart, ShieldAlert 
+  RotateCcw, Sparkles, Heart, ShieldAlert, 
+  Wifi, Share2, Database, Radio, RefreshCw, ExternalLink
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { useDuo } from '../../context/DuoContext';
+import { cloudSync } from '../../services/cloudSync';
 
 const EMOJI_OPTIONS = ['🪐', '✨', '🌸', '🚀', '🌿', '💎', '🌙', '⚡', '🕊️', '🧘', '🌊', '🔥'];
 
 export function SyncSettingsView() {
   const { 
     state, 
+    roomCode,
+    cloudStatus,
+    updateRoomCode,
+    generateShareLink,
     updateProfile, 
     exportData, 
     importData, 
@@ -18,6 +24,7 @@ export function SyncSettingsView() {
     audio 
   } = useDuo();
 
+  const [inputRoomCode, setInputRoomCode] = useState(roomCode);
   const [partnerAName, setPartnerAName] = useState(state.profiles.partnerA.name);
   const [partnerBName, setPartnerBName] = useState(state.profiles.partnerB.name);
   const [partnerAAvatar, setPartnerAAvatar] = useState(state.profiles.partnerA.avatar);
@@ -31,6 +38,17 @@ export function SyncSettingsView() {
     setPartnerBAvatar(state.profiles.partnerB.avatar);
   }, [state.profiles]);
 
+  React.useEffect(() => {
+    setInputRoomCode(roomCode);
+  }, [roomCode]);
+
+  const [copiedShareLink, setCopiedShareLink] = useState(false);
+  const [showFirebaseModal, setShowFirebaseModal] = useState(false);
+  const [firebaseConfigText, setFirebaseConfigText] = useState(() => {
+    try { return localStorage.getItem('aetheria_firebase_config') || ''; } catch { return ''; }
+  });
+  const [firebaseSaved, setFirebaseSaved] = useState(false);
+
   const [importJsonText, setImportJsonText] = useState('');
   const [importError, setImportError] = useState(false);
   const [importSuccess, setImportSuccess] = useState(false);
@@ -38,12 +56,46 @@ export function SyncSettingsView() {
   const [showQrModal, setShowQrModal] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
+  const handleUpdateRoom = () => {
+    if (!inputRoomCode.trim()) return;
+    updateRoomCode(inputRoomCode);
+  };
+
+  const handleCopyShareLink = () => {
+    const link = generateShareLink('partnerB');
+    navigator.clipboard.writeText(link).then(() => {
+      audio.playClick();
+      setCopiedShareLink(true);
+      setTimeout(() => setCopiedShareLink(false), 3000);
+    });
+  };
+
   const handleSaveProfiles = () => {
     updateProfile('partnerA', { name: partnerAName, avatar: partnerAAvatar });
     updateProfile('partnerB', { name: partnerBName, avatar: partnerBAvatar });
     audio.playBell();
     setSavedProfiles(true);
     setTimeout(() => setSavedProfiles(false), 2500);
+  };
+
+  const handleSaveFirebase = () => {
+    try {
+      if (!firebaseConfigText.trim()) {
+        cloudSync.configureFirebase(null);
+        setFirebaseSaved(true);
+        setTimeout(() => setFirebaseSaved(false), 2500);
+        return;
+      }
+      const parsed = JSON.parse(firebaseConfigText.trim());
+      const ok = cloudSync.configureFirebase(parsed);
+      if (ok) {
+        audio.playSuccess();
+        setFirebaseSaved(true);
+        setTimeout(() => setFirebaseSaved(false), 2500);
+      }
+    } catch (e) {
+      alert('Invalid JSON format for Firebase config.');
+    }
   };
 
   const handleCopyExport = () => {
@@ -74,8 +126,8 @@ export function SyncSettingsView() {
     setShowResetConfirm(false);
   };
 
-  // Compact payload for QR code
   const qrPayload = JSON.stringify({
+    room: roomCode,
     profiles: state.profiles,
     completions: state.completions,
   });
@@ -86,14 +138,117 @@ export function SyncSettingsView() {
       <div>
         <h2 className="text-base font-bold font-orbitron text-white flex items-center gap-2">
           <Settings className="w-5 h-5 text-cyan-400" />
-          Duo Profiles & Synchronization
+          Duo Profiles & Real-Time Sync
         </h2>
         <p className="text-xs text-slate-400">
-          Personalize names, transfer progress between phones, or backup your journey
+          Connect both phones live, customize names, or backup your journey
         </p>
       </div>
 
-      {/* Profile Customizer */}
+      {/* 1. Real-Time Cloud Room Card */}
+      <div className="p-4 rounded-3xl bg-gradient-to-br from-slate-900/90 via-slate-950 to-purple-950/40 border border-cyan-500/40 space-y-4 shadow-neon-cyan">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Radio className="w-4 h-4 text-cyan-400 animate-pulse" />
+            <h3 className="text-xs font-mono uppercase tracking-wider text-cyan-300 font-bold">
+              Live Cloud Room Synchronization
+            </h3>
+          </div>
+
+          {/* Connection Pill */}
+          <div className={`px-2.5 py-1 rounded-full text-[10px] font-mono font-bold flex items-center gap-1.5 border ${
+            cloudStatus === 'connected'
+              ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-300'
+              : 'bg-amber-500/20 border-amber-400/50 text-amber-300'
+          }`}>
+            <div className={`w-2 h-2 rounded-full ${
+              cloudStatus === 'connected' ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'
+            }`} />
+            <span>{cloudStatus === 'connected' ? 'Live Connected' : 'Connecting to Peer...'}</span>
+          </div>
+        </div>
+
+        <p className="text-xs text-slate-300 leading-relaxed">
+          Both phones connect live via Room Code <strong className="text-white font-mono">{roomCode}</strong>. Whenever either of you checks off a day or sends a reaction, the other phone updates in real time!
+        </p>
+
+        {/* Room Code Editor */}
+        <div className="space-y-1.5">
+          <label className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">
+            Shared Duo Room Code
+          </label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={inputRoomCode}
+              onChange={(e) => setInputRoomCode(e.target.value)}
+              placeholder="e.g. RICO-LAIK"
+              className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs font-mono font-bold text-cyan-300 tracking-wider focus:outline-none focus:border-cyan-400 uppercase"
+            />
+            <button
+              onClick={handleUpdateRoom}
+              className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white text-xs font-semibold active:scale-95 transition-all"
+            >
+              Set Room
+            </button>
+          </div>
+        </div>
+
+        {/* Magic Invite Link Button */}
+        <div className="pt-1">
+          <button
+            onClick={handleCopyShareLink}
+            className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-cyan-500 via-blue-600 to-purple-600 hover:from-cyan-400 hover:to-purple-500 text-white font-bold text-xs shadow-neon-cyan active:scale-95 transition-all flex items-center justify-center gap-2"
+          >
+            <Share2 className="w-4 h-4" />
+            {copiedShareLink ? 'Link Copied! Send via WhatsApp / iMessage' : 'Copy 1-Click Link for Girlfriend'}
+          </button>
+          <p className="text-[11px] text-slate-400 text-center mt-1.5">
+            When she taps this link, her phone connects to <span className="text-cyan-300 font-mono">{roomCode}</span> and switches to <span className="text-rose-300">{state.profiles.partnerB.name}</span> automatically!
+          </p>
+        </div>
+
+        {/* Persistent Cloud Database Accordion */}
+        <div className="pt-2 border-t border-slate-800/80">
+          <button
+            onClick={() => setShowFirebaseModal(!showFirebaseModal)}
+            className="text-xs text-purple-300 hover:text-purple-200 flex items-center gap-1.5 font-mono"
+          >
+            <Database className="w-3.5 h-3.5" />
+            <span>{showFirebaseModal ? 'Hide Cloud Database Settings' : 'Optional: Connect Free Firebase Database (24/7 Sync)'}</span>
+          </button>
+
+          {showFirebaseModal && (
+            <div className="mt-3 p-3 rounded-2xl bg-slate-950/90 border border-purple-500/30 space-y-2 text-xs">
+              <p className="text-slate-300 leading-relaxed">
+                P2P sync connects both phones live whenever you are both using the app. If you also want <strong>background 24/7 cloud sync</strong> when both apps are closed, you can paste a free Google Firebase Realtime Database configuration below:
+              </p>
+              <textarea
+                rows={4}
+                value={firebaseConfigText}
+                onChange={(e) => setFirebaseConfigText(e.target.value)}
+                placeholder='Paste your Firebase config JSON here, e.g. {"apiKey": "...", "databaseURL": "https://...firebaseio.com"}'
+                className="w-full p-2.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-purple-400"
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={handleSaveFirebase}
+                  className="py-1.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-semibold text-xs transition-all"
+                >
+                  Save Firebase Config
+                </button>
+                {firebaseSaved && (
+                  <span className="text-emerald-400 flex items-center gap-1 text-xs">
+                    ✓ Saved!
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 2. Profile Customizer */}
       <div className="p-4 rounded-3xl bg-slate-950/70 border border-slate-800 space-y-4 shadow-glass">
         <h3 className="text-xs font-mono uppercase tracking-wider text-cyan-300 font-bold flex items-center gap-1.5">
           <UserCheck className="w-4 h-4" /> Partner Profiles
@@ -180,14 +335,14 @@ export function SyncSettingsView() {
         </button>
       </div>
 
-      {/* Sync Between Phones & Sharing */}
+      {/* 3. Offline Backup & QR Pairing */}
       <div className="p-4 rounded-3xl bg-slate-950/70 border border-slate-800 space-y-4 shadow-glass">
         <div>
           <h3 className="text-xs font-mono uppercase tracking-wider text-purple-300 font-bold flex items-center gap-1.5">
-            <QrCode className="w-4 h-4" /> Two-Phone Synchronization
+            <QrCode className="w-4 h-4" /> Offline Backup & QR Pairing
           </h3>
           <p className="text-xs text-slate-400 mt-1">
-            Using different phones? You can display a pairing QR code or copy-paste your sync code to share progress effortlessly!
+            Want to backup all your journal entries or transfer without internet? Use QR or sync codes anytime.
           </p>
         </div>
 
@@ -205,39 +360,39 @@ export function SyncSettingsView() {
             className="py-2.5 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 text-xs font-medium flex items-center justify-center gap-2 active:scale-95 transition-all"
           >
             <Copy className="w-4 h-4 text-purple-400" />
-            {copiedExport ? 'Copied to Clipboard!' : 'Copy Sync Code'}
+            {copiedExport ? 'Copied to Clipboard!' : 'Copy Backup Code'}
           </button>
         </div>
 
         {/* Import Code Input */}
         <div className="space-y-2 pt-2 border-t border-slate-800/80">
           <label className="text-[11px] font-mono text-slate-400 block">
-            Import / Restore Partner's Sync Code:
+            Import / Restore Backup Code:
           </label>
           <div className="flex gap-2">
             <input
               type="text"
               value={importJsonText}
               onChange={(e) => setImportJsonText(e.target.value)}
-              placeholder="Paste sync code here..."
+              placeholder="Paste backup code here..."
               className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-cyan-400"
             />
             <button
               onClick={handleImport}
               className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold active:scale-95 transition-all"
             >
-              Sync
+              Restore
             </button>
           </div>
 
           {importSuccess && (
             <p className="text-xs text-emerald-400 font-mono">
-              ✓ Synchronized successfully!
+              ✓ Restored successfully!
             </p>
           )}
           {importError && (
             <p className="text-xs text-rose-400 font-mono">
-              ✕ Invalid code format. Please check and try again.
+              ✕ Invalid code format.
             </p>
           )}
         </div>
@@ -251,7 +406,7 @@ export function SyncSettingsView() {
               Instant Duo Sync QR
             </h4>
             <p className="text-xs text-slate-400">
-              Have your partner scan this code with their phone camera to load your journey status.
+              Scan with phone camera to load Room <span className="text-cyan-300 font-mono">{roomCode}</span>.
             </p>
 
             <div className="p-4 bg-white rounded-2xl mx-auto inline-block shadow-lg">
@@ -278,7 +433,7 @@ export function SyncSettingsView() {
           <ShieldAlert className="w-4 h-4" /> Journey Reset
         </h4>
         <p className="text-xs text-slate-400">
-          Want to start the 30-day challenge completely fresh? This clears completions and reflections.
+          Want to start fresh? This clears completions and reflections.
         </p>
 
         {showResetConfirm ? (
@@ -309,12 +464,6 @@ export function SyncSettingsView() {
             <RotateCcw className="w-3.5 h-3.5" /> Reset Challenge Progress
           </button>
         )}
-      </div>
-
-      {/* PDF Challenge Attribution / About */}
-      <div className="text-center text-slate-500 text-[11px] font-mono space-y-1 pt-2">
-        <p>Mindfulness & Reflection Challenge • 30-Day Guided Practice</p>
-        <p className="italic text-slate-400">"Small daily habits create gentle, lifelong transformations."</p>
       </div>
     </div>
   );

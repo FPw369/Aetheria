@@ -5,6 +5,8 @@ import { useDuo } from '../context/DuoContext';
 export function Navbar() {
   const { 
     state, 
+    roomCode,
+    cloudStatus,
     activeProfile, 
     otherProfile, 
     switchActiveUser, 
@@ -29,9 +31,25 @@ export function Navbar() {
             <Sparkles className="w-4 h-4 text-white animate-pulse" />
           </div>
           <div>
-            <h1 className="text-sm font-extrabold font-orbitron tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-blue-200 to-purple-300 leading-none">
-              AETHERIA
-            </h1>
+            <div className="flex items-center gap-1.5">
+              <h1 className="text-sm font-extrabold font-orbitron tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-blue-200 to-purple-300 leading-none">
+                AETHERIA
+              </h1>
+              {/* Cloud Sync Status Beacon */}
+              <div 
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-mono font-bold tracking-tight border ${
+                  cloudStatus === 'connected'
+                    ? 'bg-emerald-500/15 border-emerald-400/40 text-emerald-300'
+                    : 'bg-amber-500/15 border-amber-400/40 text-amber-300'
+                }`}
+                title={`Room Code: ${roomCode}`}
+              >
+                <div className={`w-1.5 h-1.5 rounded-full ${
+                  cloudStatus === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                }`} />
+                <span>{cloudStatus === 'connected' ? 'Live Sync' : roomCode}</span>
+              </div>
+            </div>
             <span className="text-[10px] font-mono text-slate-400 tracking-tight">
               30-Day Duo Matrix
             </span>

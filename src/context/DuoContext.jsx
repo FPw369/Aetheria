@@ -1,9 +1,11 @@
-import React, { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import confetti from 'canvas-confetti';
 import { useAudio } from '../hooks/useAudio';
+import { cloudSync } from '../services/cloudSync';
 
 const STORAGE_KEY = 'aetheria_duo_mindfulness_v2';
 const OLD_STORAGE_KEY = 'aetheria_duo_mindfulness_v1';
+const ROOM_STORAGE_KEY = 'aetheria_room_code';
 
 const DEFAULT_STATE = {
   profiles: {
@@ -12,7 +14,7 @@ const DEFAULT_STATE = {
       name: 'Rico',
       nickname: 'Cosmic Explorer',
       avatar: '🪐',
-      color: 'cyan', // cyan, purple, rose, emerald, amber
+      color: 'cyan',
       accentColor: '#38bdf8',
     },
     partnerB: {
@@ -35,6 +37,27 @@ const DEFAULT_STATE = {
 const DuoContext = createContext(null);
 
 export function DuoProvider({ children }) {
+  // Read Room Code from URL query param (?room=...) or localStorage or default 'RICO-LAIK'
+  const [roomCode, setRoomCodeState] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const urlRoom = params.get('room');
+      if (urlRoom && urlRoom.trim()) {
+        const cleaned = urlRoom.toUpperCase().trim().replace(/[^A-Z0-9_-]/g, '');
+        try { localStorage.setItem(ROOM_STORAGE_KEY, cleaned); } catch (e) {}
+        return cleaned;
+      }
+      try {
+        const stored = localStorage.getItem(ROOM_STORAGE_KEY);
+        if (stored && stored.trim()) return stored.trim();
+      } catch (e) {}
+    }
+    return 'RICO-LAIK';
+  });
+
+  const [cloudStatus, setCloudStatus] = useState('connecting'); // 'connected' | 'connecting' | 'disconnected'
+  const [lastSyncTime, setLastSyncTime] = useState(null);
+
   const [state, setState] = useState(() => {
     try {
       let raw = localStorage.getItem(STORAGE_KEY);
@@ -44,6 +67,28 @@ export function DuoProvider({ children }) {
           raw = oldRaw;
         }
       }
+
+      // Check if state is in URL query (?sync=...)
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        const urlSync = params.get('sync');
+        if (urlSync) {
+          try {
+            const decoded = JSON.parse(decodeURIComponent(escape(atob(urlSync))));
+            if (decoded && typeof decoded === 'object') {
+              raw = JSON.stringify(decoded);
+            }
+          } catch (err) {
+            console.warn('URL sync parse failed', err);
+          }
+        }
+
+        const urlUser = params.get('user');
+        if (urlUser === 'partnerA' || urlUser === 'partnerB') {
+          DEFAULT_STATE.activeUser = urlUser;
+        }
+      }
+
       if (raw) {
         const parsed = JSON.parse(raw);
         const profileA = parsed.profiles?.partnerA || {};
@@ -51,9 +96,19 @@ export function DuoProvider({ children }) {
         if (!profileA.name || profileA.name === 'Alex') profileA.name = 'Rico';
         if (!profileB.name || profileB.name === 'Maya') profileB.name = 'Laik';
 
+        let initialActiveUser = parsed.activeUser || DEFAULT_STATE.activeUser;
+        if (typeof window !== 'undefined') {
+          const params = new URLSearchParams(window.location.search);
+          const urlUser = params.get('user');
+          if (urlUser === 'partnerA' || urlUser === 'partnerB') {
+            initialActiveUser = urlUser;
+          }
+        }
+
         return {
           ...DEFAULT_STATE,
           ...parsed,
+          activeUser: initialActiveUser,
           profiles: {
             partnerA: {
               ...DEFAULT_STATE.profiles.partnerA,
@@ -76,6 +131,8 @@ export function DuoProvider({ children }) {
 
   const [lastReceivedNudge, setLastReceivedNudge] = useState(null);
   const audio = useAudio();
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   // Save to localStorage on state changes
   useEffect(() => {
@@ -86,38 +143,142 @@ export function DuoProvider({ children }) {
     }
   }, [state]);
 
+  // Set up Cloud Realtime Sync & WebRTC P2P
+  useEffect(() => {
+    cloudSync.init({
+      roomCode,
+      userRole: state.activeUser,
+      onStatusChange: (newStatus) => {
+        setCloudStatus(newStatus);
+      },
+      onStateReceived: (remoteState) => {
+        if (!remoteState || typeof remoteState !== 'object') return;
+        setLastSyncTime(new Date());
+
+        setState(prev => {
+          // Merge completions
+          const mergedCompletions = { ...(prev.completions || {}) };
+          if (remoteState.completions) {
+            Object.keys(remoteState.completions).forEach(day => {
+              const localDay = mergedCompletions[day] || {};
+              const remoteDay = remoteState.completions[day] || {};
+              mergedCompletions[day] = {
+                ...localDay,
+                partnerA: localDay.partnerA || remoteDay.partnerA || false,
+                partnerB: localDay.partnerB || remoteDay.partnerB || false,
+                atA: localDay.atA || remoteDay.atA || null,
+                atB: localDay.atB || remoteDay.atB || null,
+              };
+            });
+          }
+
+          // Merge entries
+          const mergedEntries = { ...(prev.entries || {}) };
+          if (remoteState.entries) {
+            Object.keys(remoteState.entries).forEach(day => {
+              const localDayEntries = mergedEntries[day] || {};
+              const remoteDayEntries = remoteState.entries[day] || {};
+              mergedEntries[day] = {
+                ...localDayEntries,
+                partnerA: remoteDayEntries.partnerA || localDayEntries.partnerA,
+                partnerB: remoteDayEntries.partnerB || localDayEntries.partnerB,
+              };
+            });
+          }
+
+          // Merge profiles
+          const mergedProfiles = {
+            partnerA: {
+              ...prev.profiles.partnerA,
+              ...(remoteState.profiles?.partnerA || {})
+            },
+            partnerB: {
+              ...prev.profiles.partnerB,
+              ...(remoteState.profiles?.partnerB || {})
+            }
+          };
+
+          return {
+            ...prev,
+            completions: mergedCompletions,
+            entries: mergedEntries,
+            profiles: mergedProfiles
+          };
+        });
+
+        audio.playBell();
+      },
+      onNudgeReceived: (nudge) => {
+        audio.playNudge();
+        setLastReceivedNudge(nudge);
+        setState(prev => ({
+          ...prev,
+          nudges: [nudge, ...(prev.nudges || []).slice(0, 19)]
+        }));
+
+        try {
+          confetti({
+            particleCount: 45,
+            spread: 70,
+            origin: { y: 0.75 },
+            colors: ['#f43f5e', '#fb7185', '#38bdf8', '#ffd700']
+          });
+        } catch (e) {}
+      }
+    });
+
+    return () => {
+      cloudSync.disconnect();
+    };
+  }, [roomCode, state.activeUser, audio]);
+
   const activeProfile = state.profiles[state.activeUser];
   const partnerUser = state.activeUser === 'partnerA' ? 'partnerB' : 'partnerA';
   const otherProfile = state.profiles[partnerUser];
 
+  const updateRoomCode = useCallback((newCode) => {
+    const cleaned = (newCode || 'RICO-LAIK').toUpperCase().trim().replace(/[^A-Z0-9_-]/g, '');
+    try {
+      localStorage.setItem(ROOM_STORAGE_KEY, cleaned);
+    } catch (e) {}
+    setRoomCodeState(cleaned);
+    cloudSync.updateRoom(cleaned);
+    audio.playClick();
+  }, [audio]);
+
   // Switch between Me and Girlfriend / Partner profiles
   const switchActiveUser = useCallback((userKey) => {
     audio.playClick();
-    setState(prev => ({
-      ...prev,
-      activeUser: userKey
-    }));
+    setState(prev => {
+      const next = { ...prev, activeUser: userKey };
+      cloudSync.updateRole(userKey);
+      return next;
+    });
   }, [audio]);
 
   // Update profile details
   const updateProfile = useCallback((userKey, data) => {
-    setState(prev => ({
-      ...prev,
-      profiles: {
-        ...prev.profiles,
-        [userKey]: {
-          ...prev.profiles[userKey],
-          ...data
+    setState(prev => {
+      const next = {
+        ...prev,
+        profiles: {
+          ...prev.profiles,
+          [userKey]: {
+            ...prev.profiles[userKey],
+            ...data
+          }
         }
-      }
-    }));
+      };
+      cloudSync.broadcastState(next);
+      return next;
+    });
   }, []);
 
   // Save entry for a specific day
   const saveDayEntry = useCallback((day, userKey, data) => {
     setState(prev => {
       const prevDayEntries = prev.entries[day] || {};
-      return {
+      const next = {
         ...prev,
         entries: {
           ...prev.entries,
@@ -127,6 +288,8 @@ export function DuoProvider({ children }) {
           }
         }
       };
+      cloudSync.broadcastState(next);
+      return next;
     });
   }, []);
 
@@ -141,9 +304,7 @@ export function DuoProvider({ children }) {
       const isOtherDone = !!dayCompletions[otherUser];
 
       if (nextDone) {
-        // Play audio & trigger confetti
         if (isOtherDone) {
-          // Duo complete! Special fanfare
           audio.playSuccess();
           try {
             confetti({
@@ -152,9 +313,7 @@ export function DuoProvider({ children }) {
               origin: { y: 0.65 },
               colors: ['#00f2fe', '#f43f5e', '#a855f7', '#ffd700']
             });
-          } catch (e) {
-            console.warn(e);
-          }
+          } catch (e) {}
         } else {
           audio.playBell();
           try {
@@ -164,15 +323,13 @@ export function DuoProvider({ children }) {
               origin: { y: 0.7 },
               colors: userKey === 'partnerA' ? ['#38bdf8', '#00f2fe', '#818cf8'] : ['#fb7185', '#f43f5e', '#f472b6']
             });
-          } catch (e) {
-            console.warn(e);
-          }
+          } catch (e) {}
         }
       } else {
         audio.playClick();
       }
 
-      return {
+      const next = {
         ...prev,
         completions: {
           ...prev.completions,
@@ -183,6 +340,9 @@ export function DuoProvider({ children }) {
           }
         }
       };
+
+      cloudSync.broadcastState(next);
+      return next;
     });
   }, [audio]);
 
@@ -193,7 +353,7 @@ export function DuoProvider({ children }) {
       id: Date.now() + Math.random().toString(36).substring(2, 6),
       from: state.activeUser,
       to: partnerUser,
-      type, // 'heart', 'sparkle', 'zen', 'highfive'
+      type,
       text: message || (type === 'heart' ? 'Sent you love and warm energy!' : 'Cheering you on for today!'),
       time: new Date().toISOString(),
     };
@@ -205,6 +365,8 @@ export function DuoProvider({ children }) {
       nudges: [newNudge, ...(prev.nudges || []).slice(0, 19)]
     }));
 
+    cloudSync.broadcastNudge(newNudge);
+
     try {
       confetti({
         particleCount: 25,
@@ -212,9 +374,7 @@ export function DuoProvider({ children }) {
         origin: { y: 0.8 },
         colors: ['#f43f5e', '#fb7185', '#38bdf8']
       });
-    } catch (e) {
-      console.warn(e);
-    }
+    } catch (e) {}
   }, [state.activeUser, partnerUser, audio]);
 
   // Clear nudge toast
@@ -237,7 +397,6 @@ export function DuoProvider({ children }) {
 
     const synergyPercent = Math.round((duoCount / 30) * 100);
 
-    // Calculate current streak
     let streak = 0;
     for (let day = 1; day <= 30; day++) {
       const c = state.completions[day];
@@ -257,6 +416,19 @@ export function DuoProvider({ children }) {
     };
   }, [state.completions]);
 
+  // Generate shareable link with room code and initial payload
+  const generateShareLink = useCallback((targetRole = 'partnerB') => {
+    if (typeof window === 'undefined') return '';
+    const origin = window.location.origin + window.location.pathname;
+    const cleanPayload = {
+      completions: state.completions,
+      entries: state.entries,
+      profiles: state.profiles,
+    };
+    const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(cleanPayload))));
+    return `${origin}?room=${roomCode}&user=${targetRole}&sync=${b64}`;
+  }, [roomCode, state]);
+
   // Export data as JSON / shareable payload
   const exportData = useCallback(() => {
     return JSON.stringify(state, null, 2);
@@ -268,22 +440,26 @@ export function DuoProvider({ children }) {
       const parsed = typeof incomingJson === 'string' ? JSON.parse(incomingJson) : incomingJson;
       if (!parsed || typeof parsed !== 'object') return false;
 
-      setState(prev => ({
-        ...prev,
-        ...parsed,
-        profiles: {
-          ...prev.profiles,
-          ...(parsed.profiles || {})
-        },
-        completions: {
-          ...prev.completions,
-          ...(parsed.completions || {})
-        },
-        entries: {
-          ...prev.entries,
-          ...(parsed.entries || {})
-        }
-      }));
+      setState(prev => {
+        const next = {
+          ...prev,
+          ...parsed,
+          profiles: {
+            ...prev.profiles,
+            ...(parsed.profiles || {})
+          },
+          completions: {
+            ...prev.completions,
+            ...(parsed.completions || {})
+          },
+          entries: {
+            ...prev.entries,
+            ...(parsed.entries || {})
+          }
+        };
+        cloudSync.broadcastState(next);
+        return next;
+      });
       audio.playSuccess();
       return true;
     } catch (e) {
@@ -294,18 +470,25 @@ export function DuoProvider({ children }) {
 
   // Reset progress
   const resetProgress = useCallback(() => {
-    setState(prev => ({
-      ...prev,
-      completions: {},
-      entries: {},
-      nudges: [],
-      currentDay: 1
-    }));
+    setState(prev => {
+      const next = {
+        ...prev,
+        completions: {},
+        entries: {},
+        nudges: [],
+        currentDay: 1
+      };
+      cloudSync.broadcastState(next);
+      return next;
+    });
     audio.playClick();
   }, [audio]);
 
   const value = {
     state,
+    roomCode,
+    cloudStatus,
+    lastSyncTime,
     activeProfile,
     otherProfile,
     partnerUser,
@@ -313,11 +496,13 @@ export function DuoProvider({ children }) {
     audio,
     lastReceivedNudge,
     dismissNudge,
+    updateRoomCode,
     switchActiveUser,
     updateProfile,
     toggleDayCompletion,
     saveDayEntry,
     sendNudge,
+    generateShareLink,
     exportData,
     importData,
     resetProgress,
