@@ -1,20 +1,23 @@
-import mqtt from 'mqtt';
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getDatabase, ref, set, onValue, off } from 'firebase/database';
+// src/services/cloudSync.js
+// Ultra-resilient, zero-config real-time synchronization for Rico & Laik
+// Uses native browser fetch and EventSource (SSE) over standard HTTPS (port 443)
+// 100% free, zero signup required, zero Node polyfills, works on all mobile networks.
 
 class CloudSyncService {
   constructor() {
-    this.client = null;
     this.roomCode = 'RICO-LAIK';
     this.userRole = 'partnerA';
     this.deviceId = this.getOrCreateDeviceId();
+    this.customFirebaseUrl = this.getStoredFirebaseUrl();
+    this.eventSource = null;
+    this.pollInterval = null;
+    this.visibilityHandler = null;
     this.onStateReceived = null;
     this.onNudgeReceived = null;
     this.onStatusChange = null;
-    this.status = 'disconnected';
-    this.firebaseApp = null;
-    this.firebaseDb = null;
-    this.isPublishing = false;
+    this.status = 'connecting'; // 'connected' | 'connecting' | 'disconnected'
+    this.isBroadcasting = false;
+    this.lastProcessedTimestamp = 0;
   }
 
   getOrCreateDeviceId() {
@@ -30,6 +33,30 @@ class CloudSyncService {
     }
   }
 
+  getStoredFirebaseUrl() {
+    try {
+      const stored = localStorage.getItem('aetheria_firebase_url');
+      if (stored && stored.trim()) {
+        return stored.trim().replace(/\/+$/, '');
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  setFirebaseUrl(rawUrl) {
+    const cleaned = (rawUrl || '').trim().replace(/\/+$/, '');
+    this.customFirebaseUrl = cleaned;
+    try {
+      if (cleaned) {
+        localStorage.setItem('aetheria_firebase_url', cleaned);
+      } else {
+        localStorage.removeItem('aetheria_firebase_url');
+      }
+    } catch (e) {}
+
+    this.reconnect();
+  }
+
   init({ roomCode, userRole, onStateReceived, onNudgeReceived, onStatusChange }) {
     this.roomCode = (roomCode || 'RICO-LAIK').toUpperCase().trim().replace(/[^A-Z0-9_-]/g, '');
     this.userRole = userRole || 'partnerA';
@@ -37,8 +64,20 @@ class CloudSyncService {
     this.onNudgeReceived = onNudgeReceived;
     this.onStatusChange = onStatusChange;
 
-    this.connectMqtt();
-    this.initFirebaseIfConfigured();
+    // Listen for tab focus / unlock on mobile
+    if (typeof document !== 'undefined') {
+      if (this.visibilityHandler) {
+        document.removeEventListener('visibilitychange', this.visibilityHandler);
+      }
+      this.visibilityHandler = () => {
+        if (document.visibilityState === 'visible') {
+          this.fetchLatestState();
+        }
+      };
+      document.addEventListener('visibilitychange', this.visibilityHandler);
+    }
+
+    this.reconnect();
   }
 
   updateRole(userRole) {
@@ -54,174 +93,170 @@ class CloudSyncService {
   }
 
   setStatus(newStatus) {
-    this.status = newStatus;
-    if (this.onStatusChange) {
-      this.onStatusChange(newStatus);
+    if (this.status !== newStatus) {
+      this.status = newStatus;
+      if (this.onStatusChange) {
+        this.onStatusChange(newStatus);
+      }
     }
   }
 
-  /* ------------------- Free Public Cloud Realtime Relay (MQTT over WebSockets) ------------------- */
-  connectMqtt() {
-    this.cleanupMqtt();
+  getNtfyTopic() {
+    return `aetheria_duo_${this.roomCode}`;
+  }
+
+  reconnect() {
+    this.cleanup();
     this.setStatus('connecting');
 
-    const brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
-    const clientId = `aetheria_${this.deviceId}_${Math.random().toString(16).substring(2, 6)}`;
-    const topic = `aetheria/room/${this.roomCode}`;
+    // 1. Initial State Retrieval from ntfy.sh cache and optional Firebase
+    this.fetchLatestState();
 
+    // 2. Real-Time Stream via native browser EventSource (SSE)
     try {
-      this.client = mqtt.connect(brokerUrl, {
-        clientId,
-        clean: true,
-        connectTimeout: 5000,
-        reconnectPeriod: 3000,
-        keepalive: 30,
-      });
+      const streamUrl = `https://ntfy.sh/${this.getNtfyTopic()}/sse`;
+      this.eventSource = new EventSource(streamUrl);
 
-      this.client.on('connect', () => {
+      this.eventSource.onopen = () => {
         this.setStatus('connected');
-        this.client.subscribe(topic, { qos: 1 }, (err) => {
-          if (err) console.warn('MQTT subscribe error', err);
-        });
-      });
+      };
 
-      this.client.on('message', (receivedTopic, message) => {
+      this.eventSource.onmessage = (event) => {
         try {
-          const payload = JSON.parse(message.toString());
-          this.handleIncomingData(payload);
+          if (!event.data) return;
+          const parsed = JSON.parse(event.data);
+          if (parsed.event === 'message' && parsed.message) {
+            const innerPayload = JSON.parse(parsed.message);
+            this.handleIncomingPayload(innerPayload);
+          }
         } catch (e) {
-          console.warn('MQTT parse error', e);
+          // Ignore non-json or system ping
         }
-      });
+      };
 
-      this.client.on('error', (err) => {
-        console.warn('MQTT client error', err);
-      });
-
-      this.client.on('close', () => {
-        this.setStatus('disconnected');
-      });
-
-      this.client.on('offline', () => {
-        this.setStatus('disconnected');
-      });
-
-      this.client.on('reconnect', () => {
-        this.setStatus('connecting');
-      });
+      this.eventSource.onerror = (err) => {
+        // SSE automatically reconnects in background
+        if (this.status === 'connected') {
+          this.setStatus('connecting');
+        }
+      };
     } catch (e) {
-      console.warn('Failed initializing MQTT client', e);
+      console.warn('Failed creating SSE stream:', e);
     }
+
+    // 3. Robust polling backup every 12 seconds
+    this.pollInterval = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        this.fetchLatestState();
+      }
+    }, 12000);
   }
 
-  cleanupMqtt() {
-    if (this.client) {
+  async fetchLatestState() {
+    if (this.isBroadcasting) return;
+
+    // A. Fetch from ntfy.sh poll endpoint
+    try {
+      const ntfyPollUrl = `https://ntfy.sh/${this.getNtfyTopic()}/json?poll=1`;
+      const res = await fetch(ntfyPollUrl);
+      if (res.ok) {
+        const text = await res.text();
+        const lines = text.trim().split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const item = JSON.parse(line);
+            if (item.event === 'message' && item.message) {
+              const payload = JSON.parse(item.message);
+              this.handleIncomingPayload(payload);
+            }
+          } catch (err) {
+            // line parse error
+          }
+        }
+        this.setStatus('connected');
+      }
+    } catch (e) {
+      console.warn('ntfy poll error', e);
+    }
+
+    // B. Fetch from Custom Firebase if configured
+    if (this.customFirebaseUrl) {
       try {
-        this.client.end(true);
-      } catch (e) {}
-      this.client = null;
-    }
-  }
-
-  /* ------------------- Firebase Realtime Sync (Optional) ------------------- */
-  initFirebaseIfConfigured() {
-    try {
-      const rawConfig = localStorage.getItem('aetheria_firebase_config');
-      if (!rawConfig) return;
-
-      const config = JSON.parse(rawConfig);
-      if (!config || !config.apiKey || !config.databaseURL) return;
-
-      if (!getApps().length) {
-        this.firebaseApp = initializeApp(config);
-      } else {
-        this.firebaseApp = getApp();
-      }
-
-      this.firebaseDb = getDatabase(this.firebaseApp);
-      this.subscribeFirebase();
-    } catch (e) {
-      console.warn('Firebase init error:', e);
-    }
-  }
-
-  subscribeFirebase() {
-    if (!this.firebaseDb) return;
-    const roomRef = ref(this.firebaseDb, `rooms/${this.roomCode}`);
-    onValue(roomRef, (snapshot) => {
-      if (this.isPublishing) return;
-      const val = snapshot.val();
-      if (val && val.state) {
-        this.handleIncomingData({
-          type: 'SYNC_STATE',
-          state: val.state,
-          deviceId: val.deviceId,
-          sender: val.sender,
-          timestamp: val.timestamp
-        });
-      }
-    });
-  }
-
-  configureFirebase(config) {
-    try {
-      if (config) {
-        localStorage.setItem('aetheria_firebase_config', JSON.stringify(config));
-        this.initFirebaseIfConfigured();
-        return true;
-      } else {
-        localStorage.removeItem('aetheria_firebase_config');
-        if (this.firebaseDb) {
-          const roomRef = ref(this.firebaseDb, `rooms/${this.roomCode}`);
-          off(roomRef);
+        const fbUrl = `${this.customFirebaseUrl}/rooms/${this.roomCode}/state.json`;
+        const fbRes = await fetch(fbUrl);
+        if (fbRes.ok) {
+          const fbData = await fbRes.json();
+          if (fbData && typeof fbData === 'object') {
+            this.handleIncomingPayload({
+              type: 'SYNC_STATE',
+              state: fbData,
+              deviceId: 'firebase_remote',
+              timestamp: Date.now()
+            });
+            this.setStatus('connected');
+          }
         }
-        this.firebaseApp = null;
-        this.firebaseDb = null;
-        return true;
+      } catch (e) {
+        console.warn('Firebase fetch error', e);
       }
-    } catch (e) {
-      console.error(e);
-      return false;
     }
   }
 
-  /* ------------------- Broadcasting & Receiving ------------------- */
-  broadcastState(state) {
+  async broadcastState(state) {
+    this.isBroadcasting = true;
+
     const payload = {
       type: 'SYNC_STATE',
       state: {
-        completions: state.completions,
-        entries: state.entries,
-        profiles: state.profiles,
+        completions: state.completions || {},
+        entries: state.entries || {},
+        profiles: state.profiles || {},
       },
       deviceId: this.deviceId,
       sender: this.userRole,
       timestamp: Date.now(),
     };
 
-    // 1. Publish to MQTT cloud broker with retain: true so partner gets it even if opening later
-    if (this.client && this.client.connected) {
-      const topic = `aetheria/room/${this.roomCode}`;
+    const serialized = JSON.stringify(payload);
+
+    // 1. Broadcast to ntfy.sh zero-config relay
+    try {
+      const ntfyUrl = `https://ntfy.sh/${this.getNtfyTopic()}`;
+      await fetch(ntfyUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Title': `Aetheria Sync [${this.userRole}]`,
+          'Tags': 'sparkles'
+        },
+        body: serialized
+      });
+      this.setStatus('connected');
+    } catch (e) {
+      console.warn('Broadcast to ntfy error:', e);
+    }
+
+    // 2. Broadcast to custom Firebase if configured
+    if (this.customFirebaseUrl) {
       try {
-        this.client.publish(topic, JSON.stringify(payload), { qos: 1, retain: true });
+        const fbUrl = `${this.customFirebaseUrl}/rooms/${this.roomCode}/state.json`;
+        await fetch(fbUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload.state)
+        });
       } catch (e) {
-        console.warn('MQTT publish error', e);
+        console.warn('Broadcast to Firebase error:', e);
       }
     }
 
-    // 2. Publish to Firebase if configured
-    if (this.firebaseDb) {
-      this.isPublishing = true;
-      const roomRef = ref(this.firebaseDb, `rooms/${this.roomCode}`);
-      set(roomRef, payload)
-        .catch(err => console.warn('Firebase set error', err))
-        .finally(() => {
-          setTimeout(() => { this.isPublishing = false; }, 300);
-        });
-    }
+    setTimeout(() => {
+      this.isBroadcasting = false;
+    }, 400);
   }
 
-  broadcastNudge(nudge) {
+  async broadcastNudge(nudge) {
     const payload = {
       type: 'NUDGE',
       nudge,
@@ -230,50 +265,78 @@ class CloudSyncService {
       timestamp: Date.now(),
     };
 
-    if (this.client && this.client.connected) {
-      const topic = `aetheria/room/${this.roomCode}`;
+    const serialized = JSON.stringify(payload);
+
+    try {
+      const ntfyUrl = `https://ntfy.sh/${this.getNtfyTopic()}`;
+      await fetch(ntfyUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Title': nudge.type === 'heart' ? '💖 Heart Sent' : '✨ Sparkle Sent',
+          'Priority': 'urgent',
+          'Tags': nudge.type === 'heart' ? 'sparkling_heart' : 'star2'
+        },
+        body: serialized
+      });
+    } catch (e) {
+      console.warn('Broadcast nudge error:', e);
+    }
+
+    if (this.customFirebaseUrl) {
       try {
-        // Nudges are not retained
-        this.client.publish(topic, JSON.stringify(payload), { qos: 1, retain: false });
+        const fbUrl = `${this.customFirebaseUrl}/rooms/${this.roomCode}/lastNudge.json`;
+        await fetch(fbUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
       } catch (e) {
-        console.warn('MQTT nudge publish error', e);
+        console.warn('Firebase nudge error:', e);
       }
-    }
-
-    if (this.firebaseDb) {
-      const roomNudgeRef = ref(this.firebaseDb, `rooms/${this.roomCode}/lastNudge`);
-      set(roomNudgeRef, payload).catch(err => console.warn(err));
     }
   }
 
-  handleIncomingData(data) {
-    if (!data || typeof data !== 'object') return;
-    // Discard messages originating from this exact device to prevent loop
-    if (data.deviceId === this.deviceId) return;
+  handleIncomingPayload(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    // Discard echoes from this exact device
+    if (payload.deviceId === this.deviceId) return;
 
-    if (data.type === 'SYNC_STATE' && data.state) {
+    if (payload.type === 'SYNC_STATE' && payload.state) {
       if (this.onStateReceived) {
-        this.onStateReceived(data.state);
+        this.onStateReceived(payload.state, payload.sender);
       }
-    } else if (data.type === 'NUDGE' && data.nudge) {
+    } else if (payload.type === 'NUDGE' && payload.nudge) {
+      // Prevent duplicate nudge triggers if polling re-reads the same timestamp
+      if (payload.timestamp && payload.timestamp <= this.lastProcessedTimestamp) {
+        return;
+      }
+      this.lastProcessedTimestamp = payload.timestamp || Date.now();
+
       if (this.onNudgeReceived) {
-        this.onNudgeReceived(data.nudge);
+        this.onNudgeReceived(payload.nudge);
       }
     }
   }
 
-  reconnect() {
-    this.connectMqtt();
-    if (this.firebaseDb) {
-      this.subscribeFirebase();
+  cleanup() {
+    if (this.eventSource) {
+      try {
+        this.eventSource.close();
+      } catch (e) {}
+      this.eventSource = null;
+    }
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
     }
   }
 
   disconnect() {
-    this.cleanupMqtt();
-    if (this.firebaseDb) {
-      const roomRef = ref(this.firebaseDb, `rooms/${this.roomCode}`);
-      off(roomRef);
+    this.cleanup();
+    if (this.visibilityHandler && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
     }
     this.setStatus('disconnected');
   }

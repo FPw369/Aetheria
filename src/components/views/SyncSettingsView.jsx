@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { 
   Settings, UserCheck, QrCode, Copy, Check, 
   RotateCcw, Sparkles, Heart, ShieldAlert, 
-  Wifi, Share2, Database, Radio, RefreshCw, ExternalLink
+  Wifi, Share2, Database, Radio, RefreshCw, ExternalLink,
+  ChevronDown, ChevronUp, Link as LinkIcon
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { useDuo } from '../../context/DuoContext';
@@ -16,7 +17,6 @@ export function SyncSettingsView() {
     roomCode,
     cloudStatus,
     updateRoomCode,
-    generateShareLink,
     updateProfile, 
     exportData, 
     importData, 
@@ -42,10 +42,12 @@ export function SyncSettingsView() {
     setInputRoomCode(roomCode);
   }, [roomCode]);
 
-  const [copiedShareLink, setCopiedShareLink] = useState(false);
-  const [showFirebaseModal, setShowFirebaseModal] = useState(false);
-  const [firebaseConfigText, setFirebaseConfigText] = useState(() => {
-    try { return localStorage.getItem('aetheria_firebase_config') || ''; } catch { return ''; }
+  const [copiedSyncLink, setCopiedSyncLink] = useState(false);
+  const [copiedRoomLink, setCopiedRoomLink] = useState(false);
+  const [showFirebaseGuide, setShowFirebaseGuide] = useState(false);
+  
+  const [firebaseUrl, setFirebaseUrl] = useState(() => {
+    try { return localStorage.getItem('aetheria_firebase_url') || ''; } catch { return ''; }
   });
   const [firebaseSaved, setFirebaseSaved] = useState(false);
 
@@ -61,13 +63,43 @@ export function SyncSettingsView() {
     updateRoomCode(inputRoomCode);
   };
 
-  const handleCopyShareLink = () => {
-    const link = generateShareLink('partnerB');
+  // Generate a merge link that carries all current completions and reflections safely
+  const handleCopyDirectSyncLink = (targetRole = 'partnerB') => {
+    if (typeof window === 'undefined') return;
+    const origin = window.location.origin + window.location.pathname;
+    const payload = {
+      completions: state.completions,
+      entries: state.entries,
+      profiles: state.profiles,
+    };
+    const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    const link = `${origin}?room=${roomCode}&user=${targetRole}&sync=${b64}`;
+
     navigator.clipboard.writeText(link).then(() => {
       audio.playClick();
-      setCopiedShareLink(true);
-      setTimeout(() => setCopiedShareLink(false), 3000);
+      setCopiedSyncLink(true);
+      setTimeout(() => setCopiedSyncLink(false), 3500);
     });
+  };
+
+  const handleCopyCleanRoomLink = (targetRole = 'partnerB') => {
+    if (typeof window === 'undefined') return;
+    const origin = window.location.origin + window.location.pathname;
+    const link = `${origin}?room=${roomCode}&user=${targetRole}`;
+
+    navigator.clipboard.writeText(link).then(() => {
+      audio.playClick();
+      setCopiedRoomLink(true);
+      setTimeout(() => setCopiedRoomLink(false), 3000);
+    });
+  };
+
+  const handleSaveFirebaseUrl = () => {
+    const cleaned = firebaseUrl.trim().replace(/\/+$/, '');
+    cloudSync.setDatabaseUrl(cleaned);
+    audio.playSuccess();
+    setFirebaseSaved(true);
+    setTimeout(() => setFirebaseSaved(false), 3000);
   };
 
   const handleSaveProfiles = () => {
@@ -76,26 +108,6 @@ export function SyncSettingsView() {
     audio.playBell();
     setSavedProfiles(true);
     setTimeout(() => setSavedProfiles(false), 2500);
-  };
-
-  const handleSaveFirebase = () => {
-    try {
-      if (!firebaseConfigText.trim()) {
-        cloudSync.configureFirebase(null);
-        setFirebaseSaved(true);
-        setTimeout(() => setFirebaseSaved(false), 2500);
-        return;
-      }
-      const parsed = JSON.parse(firebaseConfigText.trim());
-      const ok = cloudSync.configureFirebase(parsed);
-      if (ok) {
-        audio.playSuccess();
-        setFirebaseSaved(true);
-        setTimeout(() => setFirebaseSaved(false), 2500);
-      }
-    } catch (e) {
-      alert('Invalid JSON format for Firebase config.');
-    }
   };
 
   const handleCopyExport = () => {
@@ -130,7 +142,12 @@ export function SyncSettingsView() {
     room: roomCode,
     profiles: state.profiles,
     completions: state.completions,
+    entries: state.entries,
   });
+
+  const isCloudConnected = cloudStatus === 'connected';
+  const partnerName = state.activeUser === 'partnerA' ? state.profiles.partnerB.name : state.profiles.partnerA.name;
+  const partnerRole = state.activeUser === 'partnerA' ? 'partnerB' : 'partnerA';
 
   return (
     <div className="space-y-6 pb-24 animate-fadeIn">
@@ -138,117 +155,202 @@ export function SyncSettingsView() {
       <div>
         <h2 className="text-base font-bold font-orbitron text-white flex items-center gap-2">
           <Settings className="w-5 h-5 text-cyan-400" />
-          Duo Profiles & Real-Time Sync
+          Duo Profiles & Cross-Device Sync
         </h2>
         <p className="text-xs text-slate-400">
-          Connect both phones live, customize names, or backup your journey
+          Sync progress live across both phones, customize names, or backup entries
         </p>
       </div>
 
-      {/* 1. Real-Time Cloud Room Card */}
-      <div className="p-4 rounded-3xl bg-gradient-to-br from-slate-900/90 via-slate-950 to-purple-950/40 border border-cyan-500/40 space-y-4 shadow-neon-cyan">
+      {/* 0. Live Sync Status & Couple Room Code */}
+      <div className="p-4 rounded-3xl bg-slate-950/90 border border-slate-800 space-y-3.5 shadow-glass">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Radio className="w-4 h-4 text-cyan-400 animate-pulse" />
             <h3 className="text-xs font-mono uppercase tracking-wider text-cyan-300 font-bold">
-              Live Cloud Room Synchronization
+              Couple Cloud Frequency
             </h3>
           </div>
 
-          {/* Connection Pill */}
           <div className={`px-2.5 py-1 rounded-full text-[10px] font-mono font-bold flex items-center gap-1.5 border ${
-            cloudStatus === 'connected'
+            isCloudConnected
               ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-300'
               : 'bg-amber-500/20 border-amber-400/50 text-amber-300'
           }`}>
             <div className={`w-2 h-2 rounded-full ${
-              cloudStatus === 'connected' ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'
+              isCloudConnected ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'
             }`} />
-            <span>{cloudStatus === 'connected' ? 'Live Connected' : 'Connecting to Peer...'}</span>
+            <span>{isCloudConnected ? 'Live Cloud Synced' : 'Connecting...'}</span>
           </div>
         </div>
 
         <p className="text-xs text-slate-300 leading-relaxed">
-          Both phones connect live via Room Code <strong className="text-white font-mono">{roomCode}</strong>. Whenever either of you checks off a day or sends a reaction, the other phone updates in real time!
+          Both your phones tune into this private couple room code. Any day completed, note saved, or heart tap updates instantly across both devices.
         </p>
 
-        {/* Room Code Editor */}
         <div className="space-y-1.5">
-          <label className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">
-            Shared Duo Room Code
+          <label className="text-[10px] font-mono text-slate-400 uppercase tracking-wider block">
+            Couple Room Code:
           </label>
           <div className="flex gap-2">
             <input
               type="text"
               value={inputRoomCode}
-              onChange={(e) => setInputRoomCode(e.target.value)}
-              placeholder="e.g. RICO-LAIK"
-              className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs font-mono font-bold text-cyan-300 tracking-wider focus:outline-none focus:border-cyan-400 uppercase"
+              onChange={(e) => setInputRoomCode(e.target.value.toUpperCase())}
+              placeholder="RICO-LAIK"
+              className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs font-mono font-bold text-cyan-300 placeholder-slate-600 focus:outline-none focus:border-cyan-400"
             />
             <button
               onClick={handleUpdateRoom}
-              className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white text-xs font-semibold active:scale-95 transition-all"
+              className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold active:scale-95 transition-all"
             >
-              Set Room
+              Update Room
             </button>
           </div>
         </div>
+      </div>
 
-        {/* Magic Invite Link Button */}
-        <div className="pt-1">
+      {/* 1. Instant 1-Click Sync Link Card (Zero setup, 100% works immediately) */}
+      <div className="p-4 rounded-3xl bg-gradient-to-br from-slate-900 via-slate-950 to-cyan-950/40 border border-cyan-500/40 space-y-3.5 shadow-neon-cyan">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Share2 className="w-4 h-4 text-cyan-400" />
+            <h3 className="text-xs font-mono uppercase tracking-wider text-cyan-300 font-bold">
+              Instant 1-Click Sync Link
+            </h3>
+          </div>
+          <span className="text-[10px] font-mono text-cyan-400 bg-cyan-950/60 px-2 py-0.5 rounded-full border border-cyan-500/30">
+            No Setup Needed
+          </span>
+        </div>
+
+        <p className="text-xs text-slate-300 leading-relaxed">
+          Tap the button below and text the link to <strong className="text-white">{partnerName}</strong>. When she taps the link on her phone, all your completions and reflections merge instantly into her app:
+        </p>
+
+        <div className="pt-1 space-y-2">
           <button
-            onClick={handleCopyShareLink}
+            onClick={() => handleCopyDirectSyncLink(partnerRole)}
             className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-cyan-500 via-blue-600 to-purple-600 hover:from-cyan-400 hover:to-purple-500 text-white font-bold text-xs shadow-neon-cyan active:scale-95 transition-all flex items-center justify-center gap-2"
           >
             <Share2 className="w-4 h-4" />
-            {copiedShareLink ? 'Link Copied! Send via WhatsApp / iMessage' : 'Copy 1-Click Link for Girlfriend'}
+            {copiedSyncLink ? '✓ Link Copied! Text to ' + partnerName : 'Send My Latest Progress to ' + partnerName}
           </button>
-          <p className="text-[11px] text-slate-400 text-center mt-1.5">
-            When she taps this link, her phone connects to <span className="text-cyan-300 font-mono">{roomCode}</span> and switches to <span className="text-rose-300">{state.profiles.partnerB.name}</span> automatically!
+          <p className="text-[11px] text-slate-400 text-center">
+            Safe & persistent: Opening this link will merge your data and will <strong>never</strong> wipe out her saved progress.
           </p>
         </div>
+      </div>
 
-        {/* Persistent Cloud Database Accordion */}
+      {/* 2. 24/7 Live Real-Time Cloud Database Sync (Firebase) */}
+      <div className="p-4 rounded-3xl bg-slate-950/80 border border-slate-800 space-y-4 shadow-glass">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Database className="w-4 h-4 text-purple-400" />
+            <h3 className="text-xs font-mono uppercase tracking-wider text-purple-300 font-bold">
+              24/7 Real-Time Cloud Database
+            </h3>
+          </div>
+
+          <div className={`px-2.5 py-1 rounded-full text-[10px] font-mono font-bold flex items-center gap-1.5 border ${
+            isCloudConnected
+              ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-300'
+              : 'bg-slate-800/80 border-slate-700 text-slate-400'
+          }`}>
+            <div className={`w-2 h-2 rounded-full ${
+              isCloudConnected ? 'bg-emerald-400 animate-ping' : 'bg-slate-500'
+            }`} />
+            <span>{isCloudConnected ? 'Live Cloud Connected' : 'Not Connected'}</span>
+          </div>
+        </div>
+
+        <p className="text-xs text-slate-300 leading-relaxed">
+          Want both phones to update <strong>automatically in real time</strong> without sending links back and forth? Connect a 100% free Google Firebase Realtime Database:
+        </p>
+
+        <div className="space-y-2">
+          <label className="text-[10px] font-mono text-slate-400 uppercase tracking-wider block">
+            Firebase Realtime Database URL
+          </label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={firebaseUrl}
+              onChange={(e) => setFirebaseUrl(e.target.value)}
+              placeholder="https://your-app-default-rtdb.firebaseio.com"
+              className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-purple-400"
+            />
+            <button
+              onClick={handleSaveFirebaseUrl}
+              className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold active:scale-95 transition-all"
+            >
+              Connect
+            </button>
+          </div>
+
+          {firebaseSaved && (
+            <p className="text-xs text-emerald-400 font-mono animate-fadeIn">
+              ✓ Database URL saved! Live connection active.
+            </p>
+          )}
+        </div>
+
+        {/* 60-Second Setup Guide Accordion */}
         <div className="pt-2 border-t border-slate-800/80">
           <button
-            onClick={() => setShowFirebaseModal(!showFirebaseModal)}
-            className="text-xs text-purple-300 hover:text-purple-200 flex items-center gap-1.5 font-mono"
+            onClick={() => setShowFirebaseGuide(!showFirebaseGuide)}
+            className="w-full text-left flex items-center justify-between text-xs text-purple-300 hover:text-purple-200 font-medium py-1"
           >
-            <Database className="w-3.5 h-3.5" />
-            <span>{showFirebaseModal ? 'Hide Cloud Database Settings' : 'Optional: Connect Free Firebase Database (24/7 Sync)'}</span>
+            <span className="flex items-center gap-1.5">
+              <span>📖</span> How to get your free database in 60 seconds (Free forever)
+            </span>
+            {showFirebaseGuide ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
           </button>
 
-          {showFirebaseModal && (
-            <div className="mt-3 p-3 rounded-2xl bg-slate-950/90 border border-purple-500/30 space-y-2 text-xs">
-              <p className="text-slate-300 leading-relaxed">
-                P2P sync connects both phones live whenever you are both using the app. If you also want <strong>background 24/7 cloud sync</strong> when both apps are closed, you can paste a free Google Firebase Realtime Database configuration below:
-              </p>
-              <textarea
-                rows={4}
-                value={firebaseConfigText}
-                onChange={(e) => setFirebaseConfigText(e.target.value)}
-                placeholder='Paste your Firebase config JSON here, e.g. {"apiKey": "...", "databaseURL": "https://...firebaseio.com"}'
-                className="w-full p-2.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-200 font-mono text-[11px] focus:outline-none focus:border-purple-400"
-              />
-              <div className="flex gap-2">
-                <button
-                  onClick={handleSaveFirebase}
-                  className="py-1.5 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-semibold text-xs transition-all"
-                >
-                  Save Firebase Config
-                </button>
-                {firebaseSaved && (
-                  <span className="text-emerald-400 flex items-center gap-1 text-xs">
-                    ✓ Saved!
-                  </span>
-                )}
+          {showFirebaseGuide && (
+            <div className="mt-3 p-3.5 rounded-2xl bg-slate-900/90 border border-purple-500/30 text-xs text-slate-300 space-y-2.5 leading-relaxed">
+              <div className="flex items-start gap-2">
+                <span className="w-5 h-5 rounded-full bg-purple-500/20 text-purple-300 flex items-center justify-center font-bold text-[11px] flex-shrink-0">1</span>
+                <div>
+                  Go to <a href="https://console.firebase.google.com" target="_blank" rel="noreferrer" className="text-cyan-400 underline font-medium">console.firebase.google.com</a> on your computer or phone and click <strong>"Add project"</strong> (name it <code>aetheria</code>, no credit card required).
+                </div>
+              </div>
+
+              <div className="flex items-start gap-2">
+                <span className="w-5 h-5 rounded-full bg-purple-500/20 text-purple-300 flex items-center justify-center font-bold text-[11px] flex-shrink-0">2</span>
+                <div>
+                  In the left menu, click <strong>Build &gt; Realtime Database</strong> &gt; click <strong>"Create Database"</strong> (click Next &gt; Enable).
+                </div>
+              </div>
+
+              <div className="flex items-start gap-2">
+                <span className="w-5 h-5 rounded-full bg-purple-500/20 text-purple-300 flex items-center justify-center font-bold text-[11px] flex-shrink-0">3</span>
+                <div>
+                  Click the <strong>Rules</strong> tab at the top and change <code>false</code> to <code>true</code>:
+                  <pre className="p-2 rounded-lg bg-slate-950 border border-slate-800 text-[10px] text-cyan-300 font-mono mt-1">
+{`{
+  "rules": {
+    ".read": true,
+    ".write": true
+  }
+}`}
+                  </pre>
+                  Click <strong>Publish</strong>.
+                </div>
+              </div>
+
+              <div className="flex items-start gap-2">
+                <span className="w-5 h-5 rounded-full bg-purple-500/20 text-purple-300 flex items-center justify-center font-bold text-[11px] flex-shrink-0">4</span>
+                <div>
+                  Copy the database URL shown at the top (e.g. <code>https://aetheria-xxx-default-rtdb.firebaseio.com</code>) and paste it into the box above!
+                </div>
               </div>
             </div>
           )}
         </div>
       </div>
 
-      {/* 2. Profile Customizer */}
+      {/* 3. Profile Customizer */}
       <div className="p-4 rounded-3xl bg-slate-950/70 border border-slate-800 space-y-4 shadow-glass">
         <h3 className="text-xs font-mono uppercase tracking-wider text-cyan-300 font-bold flex items-center gap-1.5">
           <UserCheck className="w-4 h-4" /> Partner Profiles
@@ -335,14 +437,14 @@ export function SyncSettingsView() {
         </button>
       </div>
 
-      {/* 3. Offline Backup & QR Pairing */}
+      {/* 4. Camera QR Pairing & Backup */}
       <div className="p-4 rounded-3xl bg-slate-950/70 border border-slate-800 space-y-4 shadow-glass">
         <div>
           <h3 className="text-xs font-mono uppercase tracking-wider text-purple-300 font-bold flex items-center gap-1.5">
-            <QrCode className="w-4 h-4" /> Offline Backup & QR Pairing
+            <QrCode className="w-4 h-4" /> Camera QR Pairing & Backup Code
           </h3>
           <p className="text-xs text-slate-400 mt-1">
-            Want to backup all your journal entries or transfer without internet? Use QR or sync codes anytime.
+            In the same room? Scan each other's phone screen with camera to instantly merge progress.
           </p>
         </div>
 
@@ -367,14 +469,14 @@ export function SyncSettingsView() {
         {/* Import Code Input */}
         <div className="space-y-2 pt-2 border-t border-slate-800/80">
           <label className="text-[11px] font-mono text-slate-400 block">
-            Import / Restore Backup Code:
+            Import Partner's Backup Code:
           </label>
           <div className="flex gap-2">
             <input
               type="text"
               value={importJsonText}
               onChange={(e) => setImportJsonText(e.target.value)}
-              placeholder="Paste backup code here..."
+              placeholder="Paste code here..."
               className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-cyan-400"
             />
             <button
@@ -387,7 +489,7 @@ export function SyncSettingsView() {
 
           {importSuccess && (
             <p className="text-xs text-emerald-400 font-mono">
-              ✓ Restored successfully!
+              ✓ Merged successfully!
             </p>
           )}
           {importError && (
@@ -406,14 +508,14 @@ export function SyncSettingsView() {
               Instant Duo Sync QR
             </h4>
             <p className="text-xs text-slate-400">
-              Scan with phone camera to load Room <span className="text-cyan-300 font-mono">{roomCode}</span>.
+              Have your partner scan this code with their phone camera to instantly load all progress.
             </p>
 
             <div className="p-4 bg-white rounded-2xl mx-auto inline-block shadow-lg">
               <QRCodeSVG
                 value={qrPayload}
                 size={180}
-                level="M"
+                level="L"
               />
             </div>
 
@@ -433,7 +535,7 @@ export function SyncSettingsView() {
           <ShieldAlert className="w-4 h-4" /> Journey Reset
         </h4>
         <p className="text-xs text-slate-400">
-          Want to start fresh? This clears completions and reflections.
+          Want to start completely fresh? This clears completions and reflections.
         </p>
 
         {showResetConfirm ? (

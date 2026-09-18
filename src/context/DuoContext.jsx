@@ -165,38 +165,75 @@ export function DuoProvider({ children }) {
           cloudSync.broadcastState(stateRef.current);
         }
       },
-      onStateReceived: (remoteState) => {
+      onStateReceived: (remoteState, sender) => {
         if (!remoteState || typeof remoteState !== 'object') return;
         setLastSyncTime(new Date());
 
         setState(prev => {
-          // Merge completions
+          // Merge completions with sender awareness
           const mergedCompletions = { ...(prev.completions || {}) };
           if (remoteState.completions) {
             Object.keys(remoteState.completions).forEach(day => {
               const localDay = mergedCompletions[day] || {};
               const remoteDay = remoteState.completions[day] || {};
-              mergedCompletions[day] = {
-                ...localDay,
-                partnerA: localDay.partnerA || remoteDay.partnerA || false,
-                partnerB: localDay.partnerB || remoteDay.partnerB || false,
-                atA: localDay.atA || remoteDay.atA || null,
-                atB: localDay.atB || remoteDay.atB || null,
-              };
+
+              if (sender === 'partnerA') {
+                // Partner A updated their status; preserve local Partner B status unless empty
+                mergedCompletions[day] = {
+                  ...localDay,
+                  partnerA: !!remoteDay.partnerA,
+                  atA: remoteDay.atA || localDay.atA || null,
+                  partnerB: localDay.partnerB || remoteDay.partnerB || false,
+                  atB: localDay.atB || remoteDay.atB || null,
+                };
+              } else if (sender === 'partnerB') {
+                // Partner B updated their status; preserve local Partner A status unless empty
+                mergedCompletions[day] = {
+                  ...localDay,
+                  partnerA: localDay.partnerA || remoteDay.partnerA || false,
+                  atA: localDay.atA || remoteDay.atA || null,
+                  partnerB: !!remoteDay.partnerB,
+                  atB: remoteDay.atB || localDay.atB || null,
+                };
+              } else {
+                // General merge
+                mergedCompletions[day] = {
+                  ...localDay,
+                  partnerA: localDay.partnerA || remoteDay.partnerA || false,
+                  partnerB: localDay.partnerB || remoteDay.partnerB || false,
+                  atA: localDay.atA || remoteDay.atA || null,
+                  atB: localDay.atB || remoteDay.atB || null,
+                };
+              }
             });
           }
 
-          // Merge entries
+          // Merge entries with sender awareness
           const mergedEntries = { ...(prev.entries || {}) };
           if (remoteState.entries) {
             Object.keys(remoteState.entries).forEach(day => {
               const localDayEntries = mergedEntries[day] || {};
               const remoteDayEntries = remoteState.entries[day] || {};
-              mergedEntries[day] = {
-                ...localDayEntries,
-                partnerA: remoteDayEntries.partnerA || localDayEntries.partnerA,
-                partnerB: remoteDayEntries.partnerB || localDayEntries.partnerB,
-              };
+
+              if (sender === 'partnerA') {
+                mergedEntries[day] = {
+                  ...localDayEntries,
+                  partnerA: remoteDayEntries.partnerA !== undefined ? remoteDayEntries.partnerA : localDayEntries.partnerA,
+                  partnerB: localDayEntries.partnerB !== undefined ? localDayEntries.partnerB : remoteDayEntries.partnerB,
+                };
+              } else if (sender === 'partnerB') {
+                mergedEntries[day] = {
+                  ...localDayEntries,
+                  partnerA: localDayEntries.partnerA !== undefined ? localDayEntries.partnerA : remoteDayEntries.partnerA,
+                  partnerB: remoteDayEntries.partnerB !== undefined ? remoteDayEntries.partnerB : localDayEntries.partnerB,
+                };
+              } else {
+                mergedEntries[day] = {
+                  ...localDayEntries,
+                  partnerA: remoteDayEntries.partnerA || localDayEntries.partnerA,
+                  partnerB: remoteDayEntries.partnerB || localDayEntries.partnerB,
+                };
+              }
             });
           }
 
