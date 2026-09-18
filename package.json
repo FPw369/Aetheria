@@ -14,6 +14,7 @@
     "canvas-confetti": "^1.9.4",
     "firebase": "^12.19.0",
     "lucide-react": "^1.16.0",
+    "mqtt": "^5.16.0",
     "peerjs": "^1.5.5",
     "postcss": "^8.4.47",
     "qrcode.react": "^4.2.0",

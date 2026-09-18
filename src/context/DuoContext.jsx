@@ -68,61 +68,71 @@ export function DuoProvider({ children }) {
         }
       }
 
-      // Check if state is in URL query (?sync=...)
+      let parsed = raw ? JSON.parse(raw) : { ...DEFAULT_STATE };
+
+      // Check if state or user is in URL query (?room=...&user=...)
       if (typeof window !== 'undefined') {
         const params = new URLSearchParams(window.location.search);
+        let urlCleanNeeded = false;
+
+        const urlUser = params.get('user');
+        if (urlUser === 'partnerA' || urlUser === 'partnerB') {
+          parsed.activeUser = urlUser;
+          urlCleanNeeded = true;
+        }
+
         const urlSync = params.get('sync');
         if (urlSync) {
           try {
             const decoded = JSON.parse(decodeURIComponent(escape(atob(urlSync))));
             if (decoded && typeof decoded === 'object') {
-              raw = JSON.stringify(decoded);
+              // MERGE decoded state into existing storage instead of overwriting!
+              parsed.completions = { ...(parsed.completions || {}), ...(decoded.completions || {}) };
+              parsed.entries = { ...(parsed.entries || {}), ...(decoded.entries || {}) };
+              if (decoded.profiles) {
+                parsed.profiles = {
+                  partnerA: { ...(parsed.profiles?.partnerA || {}), ...(decoded.profiles.partnerA || {}) },
+                  partnerB: { ...(parsed.profiles?.partnerB || {}), ...(decoded.profiles.partnerB || {}) },
+                };
+              }
             }
           } catch (err) {
             console.warn('URL sync parse failed', err);
           }
+          urlCleanNeeded = true;
         }
 
-        const urlUser = params.get('user');
-        if (urlUser === 'partnerA' || urlUser === 'partnerB') {
-          DEFAULT_STATE.activeUser = urlUser;
+        // Clean the URL query so on refresh it never re-processes or overwrites with old sync!
+        if (urlCleanNeeded) {
+          try {
+            const roomParam = params.get('room') ? `?room=${params.get('room')}` : '';
+            const cleanUrl = window.location.pathname + roomParam;
+            window.history.replaceState({}, document.title, cleanUrl);
+          } catch (e) {}
         }
       }
 
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        const profileA = parsed.profiles?.partnerA || {};
-        const profileB = parsed.profiles?.partnerB || {};
-        if (!profileA.name || profileA.name === 'Alex') profileA.name = 'Rico';
-        if (!profileB.name || profileB.name === 'Maya') profileB.name = 'Laik';
+      const profileA = parsed.profiles?.partnerA || {};
+      const profileB = parsed.profiles?.partnerB || {};
+      if (!profileA.name || profileA.name === 'Alex') profileA.name = 'Rico';
+      if (!profileB.name || profileB.name === 'Maya') profileB.name = 'Laik';
 
-        let initialActiveUser = parsed.activeUser || DEFAULT_STATE.activeUser;
-        if (typeof window !== 'undefined') {
-          const params = new URLSearchParams(window.location.search);
-          const urlUser = params.get('user');
-          if (urlUser === 'partnerA' || urlUser === 'partnerB') {
-            initialActiveUser = urlUser;
+      return {
+        ...DEFAULT_STATE,
+        ...parsed,
+        profiles: {
+          partnerA: {
+            ...DEFAULT_STATE.profiles.partnerA,
+            ...profileA,
+            name: profileA.name || 'Rico',
+          },
+          partnerB: {
+            ...DEFAULT_STATE.profiles.partnerB,
+            ...profileB,
+            name: profileB.name || 'Laik',
           }
         }
-
-        return {
-          ...DEFAULT_STATE,
-          ...parsed,
-          activeUser: initialActiveUser,
-          profiles: {
-            partnerA: {
-              ...DEFAULT_STATE.profiles.partnerA,
-              ...profileA,
-              name: profileA.name || 'Rico',
-            },
-            partnerB: {
-              ...DEFAULT_STATE.profiles.partnerB,
-              ...profileB,
-              name: profileB.name || 'Laik',
-            }
-          }
-        };
-      }
+      };
     } catch (e) {
       console.warn('Failed reading state from localStorage', e);
     }
@@ -134,7 +144,7 @@ export function DuoProvider({ children }) {
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  // Save to localStorage on state changes
+  // Save to localStorage on every state change
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -143,13 +153,17 @@ export function DuoProvider({ children }) {
     }
   }, [state]);
 
-  // Set up Cloud Realtime Sync & WebRTC P2P
+  // Set up Cloud Realtime Sync
   useEffect(() => {
     cloudSync.init({
       roomCode,
-      userRole: state.activeUser,
+      userRole: stateRef.current.activeUser,
       onStatusChange: (newStatus) => {
         setCloudStatus(newStatus);
+        if (newStatus === 'connected') {
+          // Immediately broadcast current state on connection so partner receives it
+          cloudSync.broadcastState(stateRef.current);
+        }
       },
       onStateReceived: (remoteState) => {
         if (!remoteState || typeof remoteState !== 'object') return;
@@ -230,7 +244,7 @@ export function DuoProvider({ children }) {
     return () => {
       cloudSync.disconnect();
     };
-  }, [roomCode, state.activeUser, audio]);
+  }, [roomCode, audio]);
 
   const activeProfile = state.profiles[state.activeUser];
   const partnerUser = state.activeUser === 'partnerA' ? 'partnerB' : 'partnerA';
@@ -416,18 +430,12 @@ export function DuoProvider({ children }) {
     };
   }, [state.completions]);
 
-  // Generate shareable link with room code and initial payload
+  // Clean, permanent share link without bulky sync snapshot
   const generateShareLink = useCallback((targetRole = 'partnerB') => {
     if (typeof window === 'undefined') return '';
     const origin = window.location.origin + window.location.pathname;
-    const cleanPayload = {
-      completions: state.completions,
-      entries: state.entries,
-      profiles: state.profiles,
-    };
-    const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(cleanPayload))));
-    return `${origin}?room=${roomCode}&user=${targetRole}&sync=${b64}`;
-  }, [roomCode, state]);
+    return `${origin}?room=${roomCode}&user=${targetRole}`;
+  }, [roomCode]);
 
   // Export data as JSON / shareable payload
   const exportData = useCallback(() => {

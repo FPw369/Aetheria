@@ -1,24 +1,35 @@
-import Peer from 'peerjs';
+import mqtt from 'mqtt';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getDatabase, ref, set, onValue, off } from 'firebase/database';
 
 class CloudSyncService {
   constructor() {
-    this.peer = null;
-    this.conn = null;
+    this.client = null;
     this.roomCode = 'RICO-LAIK';
-    this.userRole = 'partnerA'; // 'partnerA' or 'partnerB'
+    this.userRole = 'partnerA';
+    this.deviceId = this.getOrCreateDeviceId();
     this.onStateReceived = null;
     this.onNudgeReceived = null;
     this.onStatusChange = null;
-    this.status = 'disconnected'; // 'connected' | 'connecting' | 'disconnected'
+    this.status = 'disconnected';
     this.firebaseApp = null;
     this.firebaseDb = null;
-    this.firebaseUnsubscribe = null;
-    this.isBroadcasting = false;
+    this.isPublishing = false;
   }
 
-  // Initialize service
+  getOrCreateDeviceId() {
+    try {
+      let id = localStorage.getItem('aetheria_device_id');
+      if (!id) {
+        id = 'dev_' + Math.random().toString(36).substring(2, 11);
+        localStorage.setItem('aetheria_device_id', id);
+      }
+      return id;
+    } catch {
+      return 'dev_' + Math.random().toString(36).substring(2, 11);
+    }
+  }
+
   init({ roomCode, userRole, onStateReceived, onNudgeReceived, onStatusChange }) {
     this.roomCode = (roomCode || 'RICO-LAIK').toUpperCase().trim().replace(/[^A-Z0-9_-]/g, '');
     this.userRole = userRole || 'partnerA';
@@ -26,15 +37,12 @@ class CloudSyncService {
     this.onNudgeReceived = onNudgeReceived;
     this.onStatusChange = onStatusChange;
 
-    this.initPeer();
+    this.connectMqtt();
     this.initFirebaseIfConfigured();
   }
 
   updateRole(userRole) {
-    if (this.userRole !== userRole) {
-      this.userRole = userRole;
-      this.reconnect();
-    }
+    this.userRole = userRole;
   }
 
   updateRoom(roomCode) {
@@ -52,100 +60,70 @@ class CloudSyncService {
     }
   }
 
-  /* ------------------- WebRTC / PeerJS P2P ------------------- */
-  initPeer() {
-    this.cleanupPeer();
-
-    const myPeerId = `aetheria-${this.roomCode.toLowerCase()}-${this.userRole}`;
-    const targetPeerId = `aetheria-${this.roomCode.toLowerCase()}-${this.userRole === 'partnerA' ? 'partnerB' : 'partnerA'}`;
-
+  /* ------------------- Free Public Cloud Realtime Relay (MQTT over WebSockets) ------------------- */
+  connectMqtt() {
+    this.cleanupMqtt();
     this.setStatus('connecting');
 
+    const brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
+    const clientId = `aetheria_${this.deviceId}_${Math.random().toString(16).substring(2, 6)}`;
+    const topic = `aetheria/room/${this.roomCode}`;
+
     try {
-      this.peer = new Peer(myPeerId, {
-        debug: 1,
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' }
-          ]
+      this.client = mqtt.connect(brokerUrl, {
+        clientId,
+        clean: true,
+        connectTimeout: 5000,
+        reconnectPeriod: 3000,
+        keepalive: 30,
+      });
+
+      this.client.on('connect', () => {
+        this.setStatus('connected');
+        this.client.subscribe(topic, { qos: 1 }, (err) => {
+          if (err) console.warn('MQTT subscribe error', err);
+        });
+      });
+
+      this.client.on('message', (receivedTopic, message) => {
+        try {
+          const payload = JSON.parse(message.toString());
+          this.handleIncomingData(payload);
+        } catch (e) {
+          console.warn('MQTT parse error', e);
         }
       });
 
-      this.peer.on('open', (id) => {
-        // Now try connecting to partner
-        this.connectToPartner(targetPeerId);
+      this.client.on('error', (err) => {
+        console.warn('MQTT client error', err);
       });
 
-      this.peer.on('connection', (conn) => {
-        this.setupConnection(conn);
+      this.client.on('close', () => {
+        this.setStatus('disconnected');
       });
 
-      this.peer.on('error', (err) => {
-        if (err.type === 'unavailable-id') {
-          // If ID already taken (e.g. reload), append random suffix
-          const fallbackId = `${myPeerId}-${Math.floor(Math.random() * 1000)}`;
-          this.peer = new Peer(fallbackId);
-        } else {
-          console.warn('PeerJS Notice:', err.type);
-        }
+      this.client.on('offline', () => {
+        this.setStatus('disconnected');
+      });
+
+      this.client.on('reconnect', () => {
+        this.setStatus('connecting');
       });
     } catch (e) {
-      console.warn('PeerJS init failed:', e);
+      console.warn('Failed initializing MQTT client', e);
     }
   }
 
-  connectToPartner(targetPeerId) {
-    if (!this.peer || this.peer.destroyed) return;
-
-    try {
-      const conn = this.peer.connect(targetPeerId, {
-        reliable: true
-      });
-
-      conn.on('open', () => {
-        this.setupConnection(conn);
-      });
-
-      conn.on('error', (e) => {
-        console.warn('Peer connection error', e);
-      });
-    } catch (e) {
-      console.warn(e);
+  cleanupMqtt() {
+    if (this.client) {
+      try {
+        this.client.end(true);
+      } catch (e) {}
+      this.client = null;
     }
   }
 
-  setupConnection(conn) {
-    this.conn = conn;
-    this.setStatus('connected');
-
-    conn.on('data', (data) => {
-      this.handleIncomingData(data);
-    });
-
-    conn.on('close', () => {
-      this.conn = null;
-      this.setStatus('disconnected');
-      // Retry connecting after 5 seconds
-      setTimeout(() => {
-        const targetPeerId = `aetheria-${this.roomCode.toLowerCase()}-${this.userRole === 'partnerA' ? 'partnerB' : 'partnerA'}`;
-        this.connectToPartner(targetPeerId);
-      }, 5000);
-    });
-  }
-
-  cleanupPeer() {
-    if (this.conn) {
-      try { this.conn.close(); } catch (e) {}
-      this.conn = null;
-    }
-    if (this.peer) {
-      try { this.peer.destroy(); } catch (e) {}
-      this.peer = null;
-    }
-  }
-
-  /* ------------------- Firebase Realtime Sync ------------------- */
+  /* ------------------- Firebase Realtime Sync (Optional) ------------------- */
   initFirebaseIfConfigured() {
     try {
       const rawConfig = localStorage.getItem('aetheria_firebase_config');
@@ -169,25 +147,20 @@ class CloudSyncService {
 
   subscribeFirebase() {
     if (!this.firebaseDb) return;
-    if (this.firebaseUnsubscribe) {
-      this.firebaseUnsubscribe();
-    }
-
     const roomRef = ref(this.firebaseDb, `rooms/${this.roomCode}`);
     onValue(roomRef, (snapshot) => {
-      if (this.isBroadcasting) return;
+      if (this.isPublishing) return;
       const val = snapshot.val();
       if (val && val.state) {
         this.handleIncomingData({
           type: 'SYNC_STATE',
           state: val.state,
+          deviceId: val.deviceId,
           sender: val.sender,
           timestamp: val.timestamp
         });
       }
     });
-
-    this.setStatus('connected');
   }
 
   configureFirebase(config) {
@@ -212,7 +185,7 @@ class CloudSyncService {
     }
   }
 
-  /* ------------------- Broadcasting & Handlers ------------------- */
+  /* ------------------- Broadcasting & Receiving ------------------- */
   broadcastState(state) {
     const payload = {
       type: 'SYNC_STATE',
@@ -221,27 +194,29 @@ class CloudSyncService {
         entries: state.entries,
         profiles: state.profiles,
       },
+      deviceId: this.deviceId,
       sender: this.userRole,
       timestamp: Date.now(),
     };
 
-    // 1. Send via WebRTC P2P if connected
-    if (this.conn && this.conn.open) {
+    // 1. Publish to MQTT cloud broker with retain: true so partner gets it even if opening later
+    if (this.client && this.client.connected) {
+      const topic = `aetheria/room/${this.roomCode}`;
       try {
-        this.conn.send(payload);
+        this.client.publish(topic, JSON.stringify(payload), { qos: 1, retain: true });
       } catch (e) {
-        console.warn('P2P send failed', e);
+        console.warn('MQTT publish error', e);
       }
     }
 
-    // 2. Send to Firebase if configured
+    // 2. Publish to Firebase if configured
     if (this.firebaseDb) {
-      this.isBroadcasting = true;
+      this.isPublishing = true;
       const roomRef = ref(this.firebaseDb, `rooms/${this.roomCode}`);
       set(roomRef, payload)
         .catch(err => console.warn('Firebase set error', err))
         .finally(() => {
-          setTimeout(() => { this.isBroadcasting = false; }, 300);
+          setTimeout(() => { this.isPublishing = false; }, 300);
         });
     }
   }
@@ -250,15 +225,18 @@ class CloudSyncService {
     const payload = {
       type: 'NUDGE',
       nudge,
+      deviceId: this.deviceId,
       sender: this.userRole,
       timestamp: Date.now(),
     };
 
-    if (this.conn && this.conn.open) {
+    if (this.client && this.client.connected) {
+      const topic = `aetheria/room/${this.roomCode}`;
       try {
-        this.conn.send(payload);
+        // Nudges are not retained
+        this.client.publish(topic, JSON.stringify(payload), { qos: 1, retain: false });
       } catch (e) {
-        console.warn('P2P nudge failed', e);
+        console.warn('MQTT nudge publish error', e);
       }
     }
 
@@ -270,7 +248,8 @@ class CloudSyncService {
 
   handleIncomingData(data) {
     if (!data || typeof data !== 'object') return;
-    if (data.sender === this.userRole) return; // ignore own broadcast
+    // Discard messages originating from this exact device to prevent loop
+    if (data.deviceId === this.deviceId) return;
 
     if (data.type === 'SYNC_STATE' && data.state) {
       if (this.onStateReceived) {
@@ -284,15 +263,14 @@ class CloudSyncService {
   }
 
   reconnect() {
-    this.cleanupPeer();
-    this.initPeer();
+    this.connectMqtt();
     if (this.firebaseDb) {
       this.subscribeFirebase();
     }
   }
 
   disconnect() {
-    this.cleanupPeer();
+    this.cleanupMqtt();
     if (this.firebaseDb) {
       const roomRef = ref(this.firebaseDb, `rooms/${this.roomCode}`);
       off(roomRef);
